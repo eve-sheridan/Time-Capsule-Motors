@@ -2,6 +2,8 @@ import os
 import json
 import requests
 import re
+import time
+import random
 from dotenv import load_dotenv
 from datetime import date, datetime
 from urllib.parse import quote
@@ -941,9 +943,13 @@ def create_repairs_for_bike(bike_record_id, repairs_list, user_id):
     Create Repair records in Airtable linked to the given bike_record_id.
     repairs_list is parsed['repairs'] from Grok.
 
+    Airtable API LIMITATION:
+      - A maximum of 10 records can be created per request
+    So we batch the create requests in chunks of 10.
+
     Expected fields per repair item:
       - repair_name (str)
-      - status: "Completed" | "Under Repair"
+      - status: "Completed" | "Under Repair" | "Waiting on Parts"
       - completed_where: "Workshop" | "Pre-arrival" | "Unknown" | null (optional; only relevant if Completed)
       - notes (str | null)
       - start_date (optional)
@@ -1010,19 +1016,31 @@ def create_repairs_for_bike(bike_record_id, repairs_list, user_id):
         print("No valid repairs to create.")
         return
 
-    payload = {"records": records_payload}
+    # -----------------------
+    # Airtable batching (10 max)
+    # -----------------------
+    BATCH_SIZE = 10
+    total_to_create = len(records_payload)
+    created_total = 0
 
-    print(f"\nCreating {len(records_payload)} repair(s) in Airtable...")
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
-    print("Repairs create status:", resp.status_code)
+    print(f"\nCreating {total_to_create} repair(s) in Airtable...")
 
-    if not resp.ok:
-        print("Error creating repairs:", resp.text)
-        return
+    for i in range(0, total_to_create, BATCH_SIZE):
+        batch = records_payload[i:i + BATCH_SIZE]
+        payload = {"records": batch}
 
-    data = resp.json()
-    created = data.get("records", [])
-    print(f"Created {len(created)} repair record(s).")
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        print(f"Repairs batch {i//BATCH_SIZE + 1} create status:", resp.status_code)
+
+        if not resp.ok:
+            print("Error creating repairs:", resp.text)
+            return
+
+        data = resp.json()
+        created = data.get("records", [])
+        created_total += len(created)
+
+    print(f"Created {created_total} repair record(s).")
 
 
 #default applies to helper function
@@ -1263,7 +1281,7 @@ def process_intake_notes():
 
     params = {
         "filterByFormula": "{Status}='New'",
-        "maxRecords": 10,
+        "maxRecords": 20,
     }
 
     print("\nChecking AI Intake for new notes...")
@@ -1415,11 +1433,20 @@ def process_intake_notes():
 def grok_parse_note(note_text: str) -> dict | None:
     """
     Sends note_text to Grok using JSON schema and returns parsed JSON (dict).
-    Robust to:
-      - ```json code fences
-      - leading/trailing non-JSON text (attempts to extract first {...} block)
-    Returns None if parsing fails.
+
+    Improvements:
+      - Retries with exponential backoff on timeouts / transient failures
+      - Longer read timeout for long, complex notes
+      - Input normalisation to reduce payload size
+      - Robust to ```json code fences
+      - Best-effort extraction of first {...} JSON object
     """
+    if not note_text or not note_text.strip():
+        return None
+
+    # Normalise whitespace to reduce payload size / latency
+    note_text = " ".join(note_text.strip().split())
+
     payload = {
         "model": MODEL,
         "messages": [
@@ -1461,34 +1488,67 @@ def grok_parse_note(note_text: str) -> dict | None:
                     return s[start : i + 1]
         return None
 
-    try:
-        resp = requests.post(API_URL, headers=headers, json=payload, timeout=60)
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+    max_attempts = 4
+    base_sleep = 2
 
-        content = _strip_code_fences(content)
-
-        # Try direct parse first
+    for attempt in range(1, max_attempts + 1):
         try:
-            parsed = json.loads(content)
-            return parsed if isinstance(parsed, dict) else None
-        except json.JSONDecodeError:
-            # Fallback: extract the first {...} object
-            candidate = _extract_first_json_object(content)
-            if not candidate:
-                print("Grok response did not contain a JSON object.")
-                print("Raw content:", content[:800])
-                return None
-            parsed = json.loads(candidate)
-            return parsed if isinstance(parsed, dict) else None
+            resp = requests.post(
+                API_URL,
+                headers=headers,
+                json=payload,
+                timeout=(10, 180),  # (connect timeout, read timeout)
+            )
 
-    except Exception as e:
-        print("Error talking to Grok:", e)
-        try:
-            print("Last response text:", resp.text[:800])  # type: ignore
-        except Exception:
-            pass
-        return None
+            # Retryable HTTP statuses
+            if resp.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(
+                    f"Retryable HTTP {resp.status_code}", response=resp
+                )
+
+            resp.raise_for_status()
+
+            content = resp.json()["choices"][0]["message"]["content"]
+            content = _strip_code_fences(content)
+
+            # Try direct JSON parse
+            try:
+                parsed = json.loads(content)
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                # Fallback: extract first {...} block
+                candidate = _extract_first_json_object(content)
+                if not candidate:
+                    print("Grok response did not contain a JSON object.")
+                    print("Raw content:", content[:800])
+                    return None
+                parsed = json.loads(candidate)
+                return parsed if isinstance(parsed, dict) else None
+
+        except (requests.Timeout, requests.ConnectionError) as e:
+            print(f"Error talking to Grok (attempt {attempt}/{max_attempts}): {e}")
+
+        except requests.HTTPError as e:
+            print(f"Grok HTTP error (attempt {attempt}/{max_attempts}): {e}")
+            try:
+                print("Response text:", resp.text[:800])  # type: ignore
+            except Exception:
+                pass
+
+        except Exception as e:
+            print("Unexpected Grok error:", e)
+            try:
+                print("Last response text:", resp.text[:800])  # type: ignore
+            except Exception:
+                pass
+            return None
+
+        # Exponential backoff with jitter
+        if attempt < max_attempts:
+            sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.75)
+            time.sleep(sleep_s)
+
+    return None
 
 
 
