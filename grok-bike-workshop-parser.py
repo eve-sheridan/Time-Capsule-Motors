@@ -220,8 +220,9 @@ def build_intake_general_notes_block(note_text: str,
 
         cw = (r.get("completed_where") or "").strip()
         tag = status
-        if status == "Completed" and cw:
-            tag = f"{status}/{cw}"
+        #remove cw tag from notes
+        #if status == "Completed" and cw:
+        #    tag = f"{status}/{cw}"
 
         extra = (r.get("notes") or "").strip()
         repair_lines.append(f"- [{tag}] {name}" + (f" — {extra}" if extra else ""))
