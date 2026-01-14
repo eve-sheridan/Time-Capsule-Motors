@@ -116,9 +116,12 @@ Rules:
 - If the note indicates it needs doing (keywords like “needs”, “require”, “to do”, “check”, “diagnose”, “replace”, “leaking”, “rattling”, “won’t start”) → status="Under Repair".
 - If unclear → default status="Under Repair" with confidence="low" and add uncertainty to notes.
 - Correct obvious transcription slips when confident (“pork boots” → “fork boots”), but if uncertain, keep original phrase in notes.
-- If the note indicates work was done now/by us (“I/we did…”, “done by me”, “in workshop”, “we replaced…”, “painted yesterday”, etc.) → completed_where="Workshop".
-- If it reads like existing history when the bike arrived (“already had…”, “came with…”, “previous owner did…”, “prior service”, “before it arrived”) → completed_where="Pre-arrival".
-- If unclear → completed_where="Unknown".
+- If the note indicates work has been completed → completed_where="Workshop".
+- If the note mentions "headlight fairing" that means "headlight cowl"
+- If the note says "both fairings" then create separate "left fairing" and "right fairing" repair entries
+- If the note says "plate fitted" that means "VIN plate fitted"
+- If the note says "new fasteners fitted" that means "some or all fairing fasteners replaced and fitted"
+- If the note says "rear brake cleaned" that means "seals have been pulled out, cleaned and regreased"
 
 """
 
@@ -996,12 +999,13 @@ def create_repairs_for_bike(bike_record_id, repairs_list, user_id):
             "Bike": [bike_record_id],
         }
 
-        # Only set Completed Where when actually completed
+        # Changed logic so Completed Where is always "Workshop"
         if status == "Completed":
-            completed_where = (r.get("completed_where") or "").strip()
-            if completed_where not in allowed_completed_where:
-                completed_where = "Unknown"
-            fields["Completed Where"] = completed_where
+           #completed_where = (r.get("completed_where") or "").strip()
+           #if completed_where not in allowed_completed_where:
+           #    completed_where = "Unknown"
+           #fields["Completed Where"] = completed_where
+            fields["Completed Where"] = "Workshop"
 
         if user_id:
             fields["Performed By"] = [user_id]
