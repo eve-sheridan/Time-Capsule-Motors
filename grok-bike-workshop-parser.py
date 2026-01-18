@@ -85,7 +85,8 @@ Return ONLY valid JSON in this exact schema:
       "start_date": "YYYY-MM-DD or null",
       "completion_date": "YYYY-MM-DD or null"
     }
-  ],
+ ],
+
   "parts_to_order": [
     {
       "part_name": "string",
@@ -1201,11 +1202,35 @@ def create_parts_box_for_bike(bike_record_id, parts_box_data, user_id):
     rec_id = data.get("id")
     print("Created parts box with record ID:", rec_id)
 
+#check if bike has primary photo already
+def bike_has_primary_photo(bike_record_id: str) -> bool:
+    table_name = "Photos"
+    url = f"{AIRTABLE_API_URL}/{quote(table_name, safe='')}"
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+
+    # Airtable formula: Bike Link contains this bike AND Primary Image = 1
+    # If Bike Link is a linked-record field, it stores record IDs.
+    formula = f"AND(FIND('{bike_record_id}', ARRAYJOIN({{Bike Link}})), {{Primary Image}}=1)"
+
+    params = {
+        "filterByFormula": formula,
+        "maxRecords": 1
+    }
+
+    r = requests.get(url, headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return len(data.get("records", [])) > 0
 
 def create_photo_records_from_intake(intake_record: dict, bike_record_id: str, user_id):
     """
     Takes an AI Intake record (already fetched from Airtable), reads attachments in 'Intake Media',
     then creates one Photos-table record per attachment linked to the given bike_record_id.
+
+    NEW BEHAVIOUR:
+    - If the bike has NO existing Primary Image, the FIRST attachment created from this intake
+      will be marked Primary Image = True.
+    - Otherwise, none of these will be marked primary.
     """
     intake_fields = intake_record.get("fields", {})
     attachments = intake_fields.get("Intake Media", [])
@@ -1213,6 +1238,9 @@ def create_photo_records_from_intake(intake_record: dict, bike_record_id: str, u
     if not attachments:
         print("No Intake Media attachments found - skipping photo creation.")
         return []
+
+    # NEW: check if bike already has a primary photo
+    already_has_primary = bike_has_primary_photo(bike_record_id)
 
     created_photo_ids = []
 
@@ -1222,13 +1250,20 @@ def create_photo_records_from_intake(intake_record: dict, bike_record_id: str, u
             "filename": att.get("filename")
         }]
 
-        photo_name = intake_fields.get("Media Notes / Caption") or f"Intake photo {i}"
+        # Optional: if Media Notes / Caption is one caption for the whole intake,
+        # it might be nicer to keep it but still make the Photo Name unique.
+        base_name = intake_fields.get("Media Notes / Caption") or "Intake photo"
+        photo_name = f"{base_name} {i}" if len(attachments) > 1 else base_name
+
+        # NEW: decide if this photo should be primary
+        is_primary = (i == 1) and (not already_has_primary)
 
         photo_payload = {
             "fields": {
                 "Photo": photo_attachment_value,
                 "Photo Name": photo_name,
                 "Bike Link": [bike_record_id],
+                "Primary Image": is_primary,  # NEW
             }
         }
 
@@ -1245,6 +1280,8 @@ def create_photo_records_from_intake(intake_record: dict, bike_record_id: str, u
         created_photo_ids.append(created["id"])
 
     print(f"Created {len(created_photo_ids)} photo record(s).")
+    if (not already_has_primary) and created_photo_ids:
+        print("Set first intake photo as Primary Image.")
     return created_photo_ids
 
 
