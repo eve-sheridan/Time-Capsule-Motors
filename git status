@@ -1,0 +1,49 @@
+[1mdiff --git a/grok-bike-workshop-parser.py b/grok-bike-workshop-parser.py[m
+[1mindex f24eeaf..10f0f49 100644[m
+[1m--- a/grok-bike-workshop-parser.py[m
+[1m+++ b/grok-bike-workshop-parser.py[m
+[36m@@ -111,18 +111,20 @@[m [mRules:[m
+ - If the note includes a bike number like 'Bike 12', treat it as a label only; still extract make/model/year/colour and odometer if present.[m
+ - If make/model/year appear but odometer not stated, set odometer_reading=null.[m
+ - If multiple colours are mentioned, return them as a single string separated by commas (e.g. "Red,White").[m
+[31m-- Extract each discrete repair/work item as one repair.[m
+[32m+[m[32m- Extract each discrete observation or work item as one repair entry. Observations include condition statements (e.g., "all lights working", "fuel tank clean", "coolant looks good") and measurements (e.g., "front brake pads 40%"). Do NOT omit them.[m
+[32m+[m[32m- For now, ALWAYS set repairs[].status="Completed" for every repair/observation extracted from the note, unless the note explicitly says something is not working / faulty / needs doing.[m
+ - If the note indicates the work has been done (keywords like “done”, “got running”, “replaced”, “new tyres”, “painted”, “swapped”, “repainted”, “installed”, “brand-new”) → status="Completed".[m
+ - If the note indicates it needs doing (keywords like “needs”, “require”, “to do”, “check”, “diagnose”, “replace”, “leaking”, “rattling”, “won’t start”) → status="Under Repair".[m
+[31m-- If unclear → default status="Under Repair" with confidence="low" and add uncertainty to notes.[m
+[32m+[m[32m- If unclear → default status="Completed" with confidence="low" and add uncertainty to notes.[m
+ - Correct obvious transcription slips when confident (“pork boots” → “fork boots”), but if uncertain, keep original phrase in notes.[m
+[31m-- If the note indicates work has been completed → completed_where="Workshop".[m
+[32m+[m[32m- Set completed_where="Pre-arrival" if the note reads like an intake/condition report (lists of "is good/working/clean/%"). Set completed_where="Workshop" only for explicit work performed in the workshop. If unclear, use "Unknown".[m
+ - If the note mentions "headlight fairing" that means "headlight cowl"[m
+ - If the note says "both fairings" then create separate "left fairing" and "right fairing" repair entries[m
+ - If the note says "plate fitted" that means "VIN plate fitted"[m
+ - If the note says "new fasteners fitted" that means "some or all fairing fasteners replaced and fitted"[m
+ - If the note says "rear brake cleaned" that means "seals have been pulled out, cleaned and regreased"[m
+[31m-[m
+[32m+[m[32m- Example: If the note says "all lights are working, front brake pads 40%, coolant looks good",[m
+[32m+[m[32m  create three separate repairs with status="Completed" and completed_where="Pre-arrival".[m
+ """[m
+ [m
+ [m
+[36m@@ -999,13 +1001,13 @@[m [mdef create_repairs_for_bike(bike_record_id, repairs_list, user_id):[m
+             "Bike": [bike_record_id],[m
+         }[m
+ [m
+[31m-        # Changed logic so Completed Where is always "Workshop"[m
+[32m+[m[32m        # Changed logic back to find completed_where[m
+         if status == "Completed":[m
+[31m-           #completed_where = (r.get("completed_where") or "").strip()[m
+[31m-           #if completed_where not in allowed_completed_where:[m
+[31m-           #    completed_where = "Unknown"[m
+[31m-           #fields["Completed Where"] = completed_where[m
+[31m-            fields["Completed Where"] = "Workshop"[m
+[32m+[m[32m           completed_where = (r.get("completed_where") or "").strip()[m
+[32m+[m[32m           if completed_where not in allowed_completed_where:[m
+[32m+[m[32m               completed_where = "Unknown"[m
+[32m+[m[32m           fields["Completed Where"] = completed_where[m
+[32m+[m[32m           # fields["Completed Where"] = "Workshop"[m
+ [m
+         if user_id:[m
+             fields["Performed By"] = [user_id][m
