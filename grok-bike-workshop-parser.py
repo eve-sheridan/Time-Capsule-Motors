@@ -35,6 +35,7 @@ AIRTABLE_API_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
 AIRTABLE_PHOTOS_TABLE = "Photos"  
 AIRTABLE_BIKES_TABLE = "Bikes"  
 AIRTABLE_AI_INTAKE_TABLE = "AI Intake"
+AIRTABLE_REPAIRS_TABLE = "Repairs"
 
 AIRTABLE_HEADERS = {
     "Authorization": f"Bearer {AIRTABLE_API_KEY}",
@@ -128,6 +129,33 @@ Rules:
   create three separate repairs with status="Completed" and completed_where="Pre-arrival".
 """
 
+repair_match_system_prompt = """
+You are an assistant that matches a repair update command to EXISTING repair records for ONE bike.
+
+You will be given:
+- A repair update note (short)
+- A list of candidate repairs for that bike (each has a record_id, repair_name, status)
+
+Your task:
+- Identify which candidate repair(s) the note refers to
+- Return ONLY JSON in this schema:
+
+{
+  "matches": [
+    {
+      "repair_record_id": "recXXXXXXXXXXXX",
+      "confidence": "high|medium|low",
+      "reason": "short explanation"
+    }
+  ]
+}
+
+Rules:
+- ONLY choose repair_record_id values that appear in the candidate list.
+- Prefer updating repairs that are not already Completed.
+- If nothing matches confidently, return {"matches": []}.
+- Return ONLY valid JSON. No extra text.
+"""
 
 
 # Functions #######
@@ -199,6 +227,224 @@ def patch_airtable_record(table_name: str, rec_id: str, fields_to_update: dict) 
     r = requests.patch(url, headers=AIRTABLE_HEADERS, json={"fields": fields_to_update}, timeout=30)
     r.raise_for_status()
     return r.json()
+
+#Repair update command
+REPAIR_UPDATE_PREFIXES = ("repair update:", "repair-update:")
+
+REPAIR_UPDATE_RE = re.compile(r"^\s*repair\s*update\s*[:\.\-]?\s*", re.IGNORECASE)
+
+def is_repair_update_command(note_text: str) -> bool:
+    return bool(note_text and REPAIR_UPDATE_RE.match(note_text))
+
+def strip_repair_update_prefix(note_text: str) -> str:
+    if not note_text:
+        return ""
+    return REPAIR_UPDATE_RE.sub("", note_text, count=1).strip()
+
+def fetch_repairs_for_bike(bike_record_id: str) -> list:
+    # Backwards-compatible alias (old function name)
+    return get_repairs_for_bike(bike_record_id)
+
+
+
+#get repairs for bike
+def get_repairs_for_bike(bike_record_id: str) -> list:
+    bike_label = get_bike_label(bike_record_id)
+    if not bike_label:
+        print(f"Could not fetch Bike Label for bike_record_id={bike_record_id}")
+        return []
+
+    # Escape quotes for Airtable formula
+    bike_label_escaped = bike_label.replace('"', '\\"')
+
+    formula = f'FIND("{bike_label_escaped}", ARRAYJOIN({{Bike}}))'
+
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_REPAIRS_TABLE}"
+    params = {"filterByFormula": formula}
+
+    resp = requests.get(url, headers=AIRTABLE_HEADERS, params=params)
+    resp.raise_for_status()
+
+    records = resp.json().get("records", [])
+    print(f"Repairs lookup formula: {formula} -> {len(records)} records")
+    return records
+
+
+def patch_repair_record(repair_record_id: str, fields_to_update: dict) -> dict:
+    table_name = "Repairs"
+    url = f"{AIRTABLE_API_URL}/{quote(table_name, safe='')}/{repair_record_id}"
+    resp = requests.patch(url, headers=AIRTABLE_HEADERS, json={"fields": fields_to_update}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+#grok match repairs to existing
+def grok_match_repairs_to_existing(note_text: str, candidate_repairs: list[dict]) -> dict | None:
+    """
+    Calls Grok to map the update note to candidate repairs for a bike.
+    Returns parsed JSON dict like {"matches":[...]} or None on failure.
+    """
+    # Make candidates compact for the LLM
+    candidates = []
+    for r in candidate_repairs:
+        rid = r.get("id")
+        f = r.get("fields", {})
+        candidates.append({
+            "repair_record_id": rid,
+            "repair_name": f.get("Repair Name", ""),
+            "status": f.get("Status", "")
+        })
+
+    user_payload = {
+        "note": " ".join((note_text or "").strip().split()),
+        "candidates": candidates
+    }
+
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": repair_match_system_prompt},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+        "temperature": 0,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.post(API_URL, headers=headers, json=payload, timeout=(10, 180))
+        if resp.status_code in (429, 500, 502, 503, 504):
+            raise requests.HTTPError(f"Retryable HTTP {resp.status_code}", response=resp)
+        resp.raise_for_status()
+
+        content = resp.json()["choices"][0]["message"]["content"].strip()
+
+        # Strip code fences if any
+        if content.startswith("```"):
+            content = re.sub(r"^```[a-zA-Z]*\s*", "", content)
+            content = re.sub(r"\s*```$", "", content).strip()
+
+        return json.loads(content)
+
+    except Exception as e:
+        print("Repair match Grok error:", e)
+        try:
+            print("Raw response:", resp.text[:800])  # type: ignore
+        except Exception:
+            pass
+        return None
+
+
+def norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+def find_best_repair_match(existing_repairs: list, target_name: str):
+    """Return a single repair record best matching target_name, or None."""
+    t = norm(target_name)
+    if not t:
+        return None
+
+    # exact-ish match first
+    for rec in existing_repairs:
+        name = rec.get("fields", {}).get("Repair Name", "")
+        if norm(name) == t:
+            return rec
+
+    # contains match (detailing vs 'Detailing')
+    for rec in existing_repairs:
+        name = rec.get("fields", {}).get("Repair Name", "")
+        if t in norm(name) or norm(name) in t:
+            return rec
+
+    return None
+
+#update repair record
+def update_repair_record(repair_record_id: str, fields: dict):
+    table_name = "Repairs"
+    table_path = quote(table_name, safe="")
+    url = f"{AIRTABLE_API_URL}/{table_path}/{repair_record_id}"
+
+    resp = requests.patch(url, headers=AIRTABLE_HEADERS, json={"fields": fields}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+# apply repair updates
+def apply_repair_updates(bike_id: str, intake_rec_id: str, original_note: str, user_id: str | None):
+    """
+    Match and apply repair completion updates for a bike.
+    """
+    update_text = strip_repair_update_prefix(original_note)
+    if not update_text:
+        return False, "Repair update note was empty after prefix."
+
+    candidate_repairs = get_repairs_for_bike(bike_id)
+
+    # temporary add to check
+    print("Repairs found:", [r["fields"].get("Repair Name") for r in candidate_repairs])
+
+    if not candidate_repairs:
+        return False, "No existing repairs found for this bike to update."
+
+    match_result = grok_match_repairs_to_existing(update_text, candidate_repairs)
+    if not match_result or "matches" not in match_result:
+        return False, "Could not interpret repair update (Grok match failed)."
+
+    matches = match_result.get("matches", []) or []
+    if not matches:
+        return False, "No confident match to existing repairs. Please specify the repair name more clearly."
+
+    today_str = date.today().isoformat()
+    updated_ids = []
+
+    # Build lookup of current fields
+    by_id = {r["id"]: r.get("fields", {}) for r in candidate_repairs}
+
+    for m in matches:
+        rid = m.get("repair_record_id")
+        if not rid or rid not in by_id:
+            continue
+
+        fields = by_id[rid]
+        current_status = (fields.get("Status") or "").strip()
+        completed_where = (fields.get("Completed Where") or "").strip()
+
+        fields_to_update = {}
+
+        # --- STATUS + DATE ---
+        if current_status != "Completed":
+            fields_to_update["Status"] = "Completed"
+            fields_to_update["Completion Date"] = today_str
+
+        # --- BACKFILL COMPLETED WHERE ---
+        if current_status == "Completed" and not completed_where:
+            fields_to_update["Completed Where"] = "Workshop"
+
+        # --- NORMAL COMPLETION PATH ---
+        if current_status != "Completed":
+            fields_to_update["Completed Where"] = "Workshop"
+
+        # --- APPEND NOTES ---
+        existing_notes = (fields.get("Detailed Notes") or "").strip()
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        add_line = f"{stamp} (AI Intake {intake_rec_id}): {update_text}"
+
+        if existing_notes:
+            fields_to_update["Detailed Notes"] = existing_notes + "\n" + add_line
+        else:
+            fields_to_update["Detailed Notes"] = add_line
+
+        if fields_to_update:
+            patch_repair_record(rid, fields_to_update)
+            updated_ids.append(rid)
+
+    if not updated_ids:
+        return False, "No repair records were updated."
+
+    return True, f"Updated {len(updated_ids)} repair(s) to Completed."
+
+
 
 # Build intake general notes block
 def build_intake_general_notes_block(note_text: str,
@@ -468,7 +714,7 @@ def norm_odo(x):
         return None
 
 import re
-
+#format general notes
 def format_general_notes(raw: str) -> str | None:
     """
     Turn messy notes into readable, line-separated bullets.
@@ -533,7 +779,7 @@ def format_general_notes(raw: str) -> str | None:
 
     return "\n".join(lines)
 
-    
+#normalise bike data    
 def normalise_bike_data(bike_data: dict) -> dict:
     """Return a copy of bike_data with consistent casing/types for matching + updating."""
     out = dict(bike_data or {})
@@ -557,6 +803,7 @@ def normalise_bike_data(bike_data: dict) -> dict:
 
     return out
 
+#mark intake needs clarifation
 def mark_intake_needs_clarification(intake_record_id: str, message: str):
     """
     Update the AI Intake record:
@@ -690,6 +937,15 @@ def update_bike_if_needed(bike_record_id: str, bike_data: dict, existing_fields:
     resp.raise_for_status()
     print(f"Updated bike {bike_record_id} with: {list(updates.keys())}")
     return True
+
+#get bike label
+def get_bike_label(bike_record_id: str) -> str:
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_BIKES_TABLE}/{bike_record_id}"
+    resp = requests.get(url, headers=AIRTABLE_HEADERS)
+    resp.raise_for_status()
+    bike = resp.json()
+    # Primary field usually comes back as the key name itself ("Bike Label")
+    return (bike.get("fields", {}).get("Bike Label") or "").strip()
 
 
 # find or create a bike record
@@ -1434,10 +1690,39 @@ def process_intake_notes():
             mark_intake_needs_clarification(rec_id, clarification_msg)
             continue
 
+
+
+        # ----------------------------
+        # Repair update mode (bike found)
+        # ----------------------------
+        print("Repair update mode?", is_repair_update_command(note_text), "| Note:", note_text[:80])
+
+        if is_repair_update_command(note_text):
+            ok, msg = apply_repair_updates(
+                bike_id=bike_id,
+                intake_rec_id=rec_id,
+                original_note=note_text,
+                user_id=user_id
+            )
+
+            if ok:
+                patch_intake(rec_id, {
+                    "Status": "Processed",
+                    "Result Summary": f"Processed repair update. {msg}",
+                    "Bike": [bike_id],
+                })
+                print("Finished repair update:", msg)
+                continue
+            else:
+                # Safe fail: don't create anything; ask for clearer instruction
+                mark_intake_needs_clarification(rec_id, msg)
+                continue
+
         # ----------------------------
         # Normal path (bike found)
         # ----------------------------
         create_repairs_for_bike(bike_id, repairs_list, user_id)
+
 
         default_applies_to = build_default_applies_to(bike_payload)
         create_parts_to_order_for_bike(
