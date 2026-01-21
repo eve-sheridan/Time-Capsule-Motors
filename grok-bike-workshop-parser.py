@@ -228,6 +228,23 @@ def patch_airtable_record(table_name: str, rec_id: str, fields_to_update: dict) 
     r.raise_for_status()
     return r.json()
 
+#extract bike code
+BIKE_CODE_RE = re.compile(r"\bB\s*0*([0-9]{1,6})\b", re.IGNORECASE)
+
+def extract_bike_code(note_text: str) -> str | None:
+    """
+    Returns canonical code like 'B31' if present, else None.
+    Matches: B31, b31, Bike B31, B 31, B0031 etc.
+    """
+    if not note_text:
+        return None
+    m = BIKE_CODE_RE.search(note_text)
+    if not m:
+        return None
+    n = int(m.group(1))
+    return f"B{n}"
+
+
 #Repair update command
 REPAIR_UPDATE_PREFIXES = ("repair update:", "repair-update:")
 
@@ -868,6 +885,47 @@ def fetch_all_bikes():
     print(f"Fetched {len(records)} bike(s) from Airtable.")
     return records
 
+#find bike by code
+def find_bike_by_code(bike_code: str) -> str | None:
+    """
+    Given 'B31' returns the Airtable Bikes record id, or None if not found/ambiguous.
+    Uses Bike ID numeric field if present; otherwise falls back to Bike Label prefix.
+    """
+    if not bike_code:
+        return None
+
+    # Extract numeric part
+    m = re.match(r"^B([0-9]+)$", bike_code.strip().upper())
+    if not m:
+        return None
+    bike_num = int(m.group(1))
+
+    all_bikes = fetch_all_bikes()
+
+    matches = []
+
+    for r in all_bikes:
+        f = r.get("fields", {})
+
+        # Preferred: match the actual numeric Bike ID field if it exists
+        # (This assumes you have a 'Bike ID' number field in Bikes.)
+        if f.get("Bike ID") == bike_num:
+            matches.append(r)
+            continue
+
+        # Fallback: match Bike Label starting with "B31"
+        label = (f.get("Bike Label") or "").strip().upper()
+        if label.startswith(f"B{bike_num}"):
+            matches.append(r)
+
+    if len(matches) == 1:
+        return matches[0]["id"]
+
+    if len(matches) > 1:
+        print(f"Bike code {bike_code} matched {len(matches)} bikes (ambiguous).")
+        return None
+
+    return None
 
 
 # Update bike record if required
@@ -1606,6 +1664,18 @@ def process_intake_notes():
         rec_id = rec["id"]
         fields = rec.get("fields", {})
         note_text = fields.get("Note", "") or ""
+        #new section added to find bike_code
+        bike_code = extract_bike_code(note_text)
+        bike_id_override = None
+
+        if bike_code:
+            bike_id_override = find_bike_by_code(bike_code)
+            if bike_id_override:
+                print(f"Bike code override detected: {bike_code} -> {bike_id_override}")
+            else:
+                print(f"Bike code detected ({bike_code}) but could not resolve uniquely.")
+
+        ##
         user_id = get_effective_user_id(fields)
 
         print(f"\nProcessing intake record {rec_id}...")
@@ -1624,7 +1694,18 @@ def process_intake_notes():
         bike_payload = parsed.get("bike", {}) or {}
 
         # 2) Find/Create bike (pass user_id so create can set Assigned User)
-        bike_id = find_or_create_bike(bike_payload, user_id=user_id)
+        if bike_id_override:
+            bike_id = bike_id_override
+
+            # still update missing details on the bike
+            # using what Grok extracted (odo, vin etc) without changing identity.
+            try:
+                bike_rec = get_airtable_record(AIRTABLE_BIKES_TABLE, bike_id)
+                update_bike_if_needed(bike_id, bike_payload, bike_rec.get("fields", {}))
+            except Exception as ex:
+                print("WARNING: bike override found but update_bike_if_needed failed:", ex)
+        else:
+            bike_id = find_or_create_bike(bike_payload, user_id=user_id)
 
         # If found/created, ensure assigned user is set if blank (safe/no overwrite)
         if bike_id:
