@@ -929,7 +929,14 @@ def find_bike_by_code(bike_code: str) -> str | None:
 
 
 # Update bike record if required
-def update_bike_if_needed(bike_record_id: str, bike_data: dict, existing_fields: dict) -> bool:
+#old...def update_bike_if_needed(bike_record_id: str, bike_data: dict, existing_fields: dict) -> bool:
+def update_bike_if_needed(
+    bike_record_id: str,
+    bike_data: dict,
+    existing_fields: dict,
+    *,
+    allow_odo_overwrite: bool = False
+) -> bool:
     """
     Update bike record:
     - Fill missing VIN / Odo Type / Notes / Colour
@@ -976,12 +983,19 @@ def update_bike_if_needed(bike_record_id: str, bike_data: dict, existing_fields:
     #     if existing_colour != norm_colour(new_colour):
     #         updates["Colour"] = new_colour
 
-    # Odometer Reading: update if different (common real-world case)
+
+    # Odometer Reading:
+    # - Always fill if missing
+    # - Only overwrite an existing odo if the match was "high confidence"
     new_odo = bike_data.get("odometer_reading")
     if new_odo is not None:
         existing_odo = norm_odo(existing_fields.get("Odometer Reading"))
-        if existing_odo != new_odo:
+
+        if existing_odo is None:
             updates["Odometer Reading"] = new_odo
+        elif allow_odo_overwrite and existing_odo != new_odo:
+            updates["Odometer Reading"] = new_odo
+    
 
     if not updates:
         return False
@@ -1126,7 +1140,7 @@ def find_or_create_bike(bike_data, user_id=None):
         if len(vin_matches) == 1:
             bike_id = vin_matches[0]["id"]
             existing_fields = vin_matches[0].get("fields", {})
-            update_bike_if_needed(bike_id, bike_data, existing_fields)
+            update_bike_if_needed(bike_id, bike_data, existing_fields, allow_odo_overwrite=True)
             assign_user_if_blank(bike_id, existing_fields)
             print("Found existing bike by VIN with record ID:", bike_id)
             return bike_id
@@ -1134,7 +1148,48 @@ def find_or_create_bike(bike_data, user_id=None):
         if len(vin_matches) > 1:
             print(f"Needs clarification: VIN matches {len(vin_matches)} bikes. Add more detail (year/odo/colour).")
             return None
-        # No VIN match → continue
+        
+#**NEW
+        # ✅ VIN provided but not found → DO NOT fall through to Make/Model/Year matching.
+        # Create a NEW bike record immediately (prevents accidental merges like B28).
+        print("VIN provided but not found in Airtable → creating NEW bike record.")
+
+        fields = {
+            "Make": make,
+            "Model": model,
+            "Year": year,
+            "Colour": bike_data.get("colour"),
+            "VIN / Engine Number": bike_data.get("vin_engine_number"),
+            "Status": bike_data.get("status"),
+            "Odometer Reading": bike_data.get("odometer_reading"),
+            "Odometer Type": bike_data.get("odometer_type") or "Km",
+        }
+
+        # set Assigned User on new bikes
+        if user_id:
+            fields["Assigned User"] = [user_id]
+
+        fields = {k: v for k, v in fields.items() if v is not None}
+
+        payload = {"fields": fields}
+        resp = requests.post(
+            f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_BIKES_TABLE}",
+            headers=AIRTABLE_HEADERS,
+            json=payload
+        )
+        if resp.status_code >= 400:
+            print("Create bike failed:", resp.status_code)
+            print(resp.text)
+        resp.raise_for_status()
+
+        created = resp.json()
+        bike_id = created["id"]
+        print("Created new bike with record ID:", bike_id)
+        return bike_id
+    
+    #**NEW
+
+
 
     # 3) If we don't have make+model, we can't match and we can't create safely
     if not (make and model):
@@ -1701,7 +1756,7 @@ def process_intake_notes():
             # using what Grok extracted (odo, vin etc) without changing identity.
             try:
                 bike_rec = get_airtable_record(AIRTABLE_BIKES_TABLE, bike_id)
-                update_bike_if_needed(bike_id, bike_payload, bike_rec.get("fields", {}))
+                update_bike_if_needed(bike_id, bike_payload, bike_rec.get("fields", {}), allow_odo_overwrite=True)
             except Exception as ex:
                 print("WARNING: bike override found but update_bike_if_needed failed:", ex)
         else:
